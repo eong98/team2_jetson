@@ -82,8 +82,20 @@ VISITOR_ENTER_ENDPOINT = FASTAPI_BASE_URL + "/api/cctv/visitor/enter"
 VISITOR_EXIT_ENDPOINT = FASTAPI_BASE_URL + "/api/cctv/visitor/exit"
 REPORT_TIMEOUT_SEC = 60      # 서버가 LLM(comnet 생성)을 기다리므로 넉넉히. 비동기라 루프엔 영향 없음.
 
-ENABLE_DAMAGE = True         # 02 기물파손 판정 on/off
-ENABLE_FIRE = True           # 06 화재 판정 on/off (DB에 06 코드 없으면 서버가 400으로 거부함)
+# 판정할 코드 기본값. --codes 옵션으로 실행할 때마 바꿀 수 있다.
+#
+# [테스트 주의] 02(기물파손)는 "고정 카메라 + 정지된 매장"을 가정한 로직이다.
+# 모니터에 영상을 띄워놓고 카메라로 찍으면 화면이 계속 바뀌므로 02가 끊임없이 재감지된다.
+# 그럴 때는 `--codes 01,03,04,05` 처럼 02를 빼고 테스트하거나, 영상을 `--source`로 직접
+# 입력해서 테스트할 것.
+ALL_CODES = ("01", "02", "03", "04", "05", "06")
+
+# 시작 직후 이 시간(초) 동안은 이상행동 판정 결과를 버린다.
+# 이유: 카메라가 켜지는 순간 자동노출/화이트밸런스가 잡히면서 화면 밝기와 색이 크게 요동치고,
+# 첫 프레임들은 기준 프레임도 아직 안정되지 않아 오탐이 잘 난다(실기기에서 확인).
+# 판정기 내부에도 각자 warmup이 있지만, 전역으로 한 번 더 막아두면 테스트가 훨씬 깔끔해진다.
+# 손님 입·퇴장 집계는 막지 않는다 - 시작 시점에 이미 서 있는 사람은 실제 방문객이기 때문.
+STARTUP_GRACE_SEC = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +344,23 @@ def report_visitor(kind: str, data: dict) -> None:
     _enqueue(kind, data)
 
 
+def drain_queue(timeout: float = 5.0) -> None:
+    """종료 시 큐에 남은 전송이 끝날 때까지 '제한된 시간만' 기다린다.
+
+    [중요] 예전에 여기서 queue.join()을 썼다가 심각한 문제가 있었다.
+    서버가 느리거나 안 뜬 상태면 POST 하나가 최대 REPORT_TIMEOUT_SEC(60초)를 기다리므로,
+    큐에 몇 건 쌓여 있으면 종료가 수 분간 매달린다. 그 사이 cap.release()가 실행되지 않아
+    **카메라를 계속 붙잡은 프로세스가 남고, 다음 실행이 "프레임 읽기 실패"로 죽는다.**
+    기다리는 것보다 카메라를 놓는 게 훨씬 중요하므로 상한을 둔다.
+    """
+    deadline = time.time() + timeout
+    while not _event_queue.empty() and time.time() < deadline:
+        time.sleep(0.2)
+    left = _event_queue.qsize()
+    if left:
+        print("[worker] 전송 대기 %d건을 남기고 종료합니다 (서버 응답이 느린 상태)" % left)
+
+
 # ---------------------------------------------------------------------------
 # 4) 디버그 화면 스트리밍 (표준 라이브러리만 사용)
 # ---------------------------------------------------------------------------
@@ -477,6 +506,28 @@ def draw_debug_overlay(frame, tracked, manager, now, stats):
 # 5) 입력 소스 열기
 # ---------------------------------------------------------------------------
 
+def video_clock(pos_ms, last_pos_ms, loop_offset):
+    """영상 파일의 재생 위치(POS_MSEC)를 '단조증가하는 누적 경과시간'으로 바꿔준다.
+
+    왜 필요한가:
+      --loop로 영상이 처음으로 되감기면 POS_MSEC도 0으로 리셋된다. 그 값을 그대로
+      시간 기준으로 쓰면 now가 영상 길이만큼 **과거로 점프**한다. 룰 엔진은 전부
+      "now - 이전시각"으로 지속시간/쿨다운/warmup을 재기 때문에, 시간이 거꾸로 흐르면
+      그 차이가 음수가 되어 판정이 통째로 마비된다(2회차부터 이벤트가 안 뜨는 증상).
+      실제로 DamageDetector는 warming_up이 영구 True가 되어 02가 영영 안 떴다.
+
+    그래서 되감긴 것을 감지하면 직전까지의 길이를 loop_offset에 누적해서,
+    바깥에서 보는 시간축이 항상 증가하도록 만든다.
+    (time.monotonic()이 시스템 시계 변경에 영향받지 않게 설계된 것과 같은 원리)
+
+    반환: (누적 경과 ms, 새 last_pos_ms, 새 loop_offset, 되감김 여부)
+    """
+    looped = pos_ms + 1.0 < last_pos_ms      # 1ms 여유: 미세한 역행은 무시
+    if looped:
+        loop_offset += last_pos_ms
+    return loop_offset + pos_ms, pos_ms, loop_offset, looped
+
+
 def open_capture(source: str):
     if source == "camera":
         cap = cv2.VideoCapture(CSI_PIPELINE, cv2.CAP_GSTREAMER)
@@ -501,6 +552,14 @@ def parse_args():
                    help="현재 시각과 무관하게 영업시간 외로 간주 (04 무단침입 테스트용)")
     p.add_argument("--loiter", type=float, default=LOITER_SEC,
                    help="05 장시간체류 임계(초). 테스트할 땐 20 정도로 낮춰서 확인")
+    p.add_argument("--no-dedup", action="store_true",
+                   help="중복 억제를 끄고 룰이 감지한 이벤트를 전부 전송한다. "
+                        "판정 임계값을 튜닝할 때 사용 (운영에서는 절대 쓰지 말 것 - 알림 폭주)")
+    p.add_argument("--warmup", type=float, default=STARTUP_GRACE_SEC,
+                   help="시작 직후 이 시간(초) 동안 이상행동 판정을 무시한다 (카메라 노출 안정화)")
+    p.add_argument("--codes", default="all",
+                   help="판정할 코드만 지정 (예: 01,03,04,05). 기본 all. "
+                        "모니터로 영상 찍으며 테스트할 땐 02를 빼는 게 좋다")
     p.add_argument("--no-display", action="store_true",
                    help="디버그 화면을 띄우지 않는다(그냥 돌리기용). 오버레이 연산이 빠져서 조금 더 빠름")
     p.add_argument("--port", type=int, default=8090, help="디버그 화면 포트")
@@ -525,6 +584,16 @@ def main() -> None:
     incidents = IncidentTracker()              # 같은 상황 반복 전송 억제
     visitors = VisitorTracker(cno=CNO, long_stay_sec=args.loiter)
 
+    if args.codes.strip().lower() in ("all", ""):
+        enabled_codes = set(ALL_CODES)
+    else:
+        enabled_codes = set(c.strip() for c in args.codes.split(",") if c.strip())
+        unknown = enabled_codes - set(ALL_CODES)
+        if unknown:
+            raise SystemExit("알 수 없는 코드: %s (가능: %s)" % (",".join(sorted(unknown)), ",".join(ALL_CODES)))
+    enable_damage = "02" in enabled_codes
+    enable_fire = "06" in enabled_codes
+
     show_display = not args.no_display
     if show_display:
         start_debug_server(args.port)
@@ -533,11 +602,15 @@ def main() -> None:
     start_sender_thread()
     get_homography()     # homography.json 로드 (없으면 경고만 출력하고 좌표 없이 동작)
 
-    print("[worker] 시작 (source=%s, report=%s, loiter=%.0fs) - Ctrl+C로 종료"
-          % (args.source, _enable_report, args.loiter))
+    print("[worker] 시작 (source=%s, report=%s, loiter=%.0fs, codes=%s%s) - Ctrl+C로 종료"
+          % (args.source, _enable_report, args.loiter, ",".join(sorted(enabled_codes)),
+             ", 중복억제 OFF" if args.no_dedup else ""))
 
     wall_start = time.time()
+    first_now = None          # 첫 프레임의 기준 시각 (warmup 계산용)
+    warmup_done = False
     last_status_at = 0.0
+    last_pos_ms, loop_offset = 0.0, 0.0   # --loop 시 영상 시간축을 단조증가로 유지
     fps, frame_count, fps_t0 = 0.0, 0, time.time()
     stats = {"fps": 0.0, "damage_ratio": 0.0, "fire_ratio": 0.0, "fire_flicker": 0.0}
 
@@ -558,29 +631,57 @@ def main() -> None:
             # 시간 기준: 카메라는 실제 시각, 영상 파일은 영상 내부 타임스탬프를 쓴다.
             # (영상은 추론 속도 때문에 실시간보다 느리게 재생되는데, 실제 시각으로 재면
             #  "3초간 쓰러진 자세 유지" 같은 판정이 영상 내용과 어긋나기 때문)
+            # [2026-09-18 버그 수정] --loop로 영상이 처음으로 돌아가면 POS_MSEC도 0으로
+            #   리셋되므로 now가 '영상 길이만큼 과거로' 점프했다. 시간이 거꾸로 흐르면
+            #   now - last_seen 이 음수가 되어 쿨다운/지속시간/warmup 판정이 전부 깨진다
+            #   (2회차부터 이벤트가 한동안 아예 안 뜨는 증상). 그래서 되감긴 만큼을
+            #   loop_offset에 누적해 시간이 단조증가(monotonic)하도록 만든다.
             if is_video_file:
                 pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0
-                now = wall_start + pos_ms / 1000.0
+                elapsed_ms, last_pos_ms, loop_offset, looped = \
+                    video_clock(pos_ms, last_pos_ms, loop_offset)
+                if looped:
+                    print("[worker] 영상 반복 재생 (누적 %.1f초)" % (elapsed_ms / 1000.0))
+                now = wall_start + elapsed_ms / 1000.0
             else:
                 now = time.time()
+
+            if first_now is None:
+                first_now = now
 
             detections = get_person_boxes(frame)
             boxes_only = [box for box, _ in detections]
             tracked = tracker.update(boxes_only, now=now)
 
             manager.update(tracked, now=now)
+            # wall_now: 영업시간(04 무단침입) 판정용 '실제 현재시각'.
+            # now는 영상 파일 모드에선 영상 재생 위치(0초부터)라서 시각 판정에 쓸 수 없다.
             events = manager.check_all(now=now,
                                        business_hours=BUSINESS_HOURS,
-                                       force_after_hours=args.after_hours)
+                                       force_after_hours=args.after_hours,
+                                       wall_now=time.time())
+
+            # 코드 필터: 비활성 코드는 아예 판정에서 제외 (테스트 편의 + CPU 절약)
+            if len(enabled_codes) < len(ALL_CODES):
+                events = [e for e in events if e.code in enabled_codes]
 
             # 02 기물파손 / 06 화재는 사람 추적과 무관하게 프레임 전체를 보고 판정
-            if ENABLE_DAMAGE:
+            if enable_damage:
                 dmg_event, dmg_ratio = damage_detector.update(frame, boxes_only, now)
                 stats["damage_ratio"] = dmg_ratio
+                # [2026-09-18] 폭행 증거가 쌓이는 중이면 02는 보류한다.
+                # 싸움은 사람이 격하게 움직이므로 화면 변화도 크게 남는데, 그걸 기물파손으로
+                # 먼저 내보내면 정작 01이 incident 단계에서 02에 밀려 묻힌다.
+                # (incident.SUPPRESSED_BY는 01이 '확정된 뒤'에만 02를 막아주므로,
+                #  01 확정까지 걸리는 2초 구간은 여기서 따로 막아야 한다.)
+                if dmg_event and manager.assault_score > 0.0:
+                    print("[worker] 02 보류: 폭행 판정 진행 중 (assault_score=%.2f)"
+                          % manager.assault_score)
+                    dmg_event = None
                 if dmg_event:
                     events.append(dmg_event)
-            if ENABLE_FIRE:
-                fire_event, fire_ratio, flicker = fire_detector.update(frame, now)
+            if enable_fire:
+                fire_event, fire_ratio, flicker = fire_detector.update(frame, boxes_only, now)
                 stats["fire_ratio"], stats["fire_flicker"] = fire_ratio, flicker
                 if fire_event:
                     events.append(fire_event)
@@ -595,7 +696,20 @@ def main() -> None:
             # [중요] 룰 엔진이 낸 이벤트를 그대로 보내지 않고 상황 단위로 한 번 거른다.
             # 쓰러진 사람이 계속 누워 있으면 룰은 매번 감지하지만, 여기서 최초 1회와
             # 정해진 재알림 시점만 통과시킨다. (incident.py 참고)
-            for ev in incidents.process(events, now=now):
+            # 시작 직후 유예: 카메라 노출이 잡히기 전의 오탐을 버린다.
+            # incidents.process()는 계속 호출해서 상황 상태는 정상적으로 관리되게 하고,
+            # 전송만 막는다(여기서 이벤트 목록을 비우면 상황 추적 자체가 어긋난다).
+            in_warmup = first_now is not None and (now - first_now) < args.warmup
+            if in_warmup:
+                events = []
+            elif not warmup_done:
+                warmup_done = True
+                print("[worker] 준비 완료 - 이상행동 판정 시작 (warmup %.1f초)" % args.warmup)
+
+            # incidents.process()는 항상 호출한다(상황 상태 관리가 여기서 이뤄짐).
+            # --no-dedup일 때만 그 결과를 무시하고 룰이 낸 이벤트를 전부 보낸다.
+            passed = incidents.process(events, now=now)
+            for ev in (events if args.no_dedup else passed):
                 report_issue(ev)
 
             # FPS 계산 (실제 처리 속도. 낮으면 추적이 불안정해지므로 튜닝 지표로 중요)
@@ -608,12 +722,14 @@ def main() -> None:
 
             if show_display:
                 stats["visitors"] = visitors.active_count
-                stats["incidents"] = incidents.status_line()
+                stats["incidents"] = incidents.status_line(now)
                 debug_frame = draw_debug_overlay(frame.copy(), tracked, manager, now, stats)
                 _update_debug_frame(debug_frame)
 
             if time.time() - last_status_at >= 5.0:
-                extra = incidents.status_line()
+                extra = incidents.status_line(now)
+                if in_warmup:
+                    extra = ("준비중 %.1fs" % (args.warmup - (now - first_now))) + (" " + extra if extra else "")
                 print("[worker] 사람 %d명(손님 %d) | fps %.1f | 폭행점수 %.1f | 전송대기 %d %s"
                       % (len(tracked), visitors.active_count, fps,
                          manager.assault_score, _event_queue.qsize(), extra))
@@ -622,15 +738,19 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n[worker] 종료")
     finally:
+        # [순서 중요] 카메라를 가장 먼저 놓는다.
+        # 카메라는 한 프로세스만 열 수 있는 자원이라, 이걸 못 놓으면 다음 실행이 통째로 막힌다.
+        # 전송 마무리보다 우선순위가 높다.
+        cap.release()
+
         # 아직 '입장중'으로 남아있는 손님들을 퇴장 처리한다.
         # 안 하면 STATE=0 행이 DB에 영원히 남아서 "현재 매장 인원"이 계속 늘어난 것처럼 보인다.
         try:
             for e in visitors.flush():
                 report_visitor("exit", e)
-            _event_queue.join()        # 큐에 남은 전송이 끝날 때까지 잠깐 대기
+            drain_queue(5.0)
         except Exception as e:
             print("[worker] 종료 처리 중 오류: %s" % e)
-        cap.release()
 
 
 if __name__ == "__main__":

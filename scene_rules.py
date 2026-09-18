@@ -66,6 +66,18 @@ DAMAGE_COOLDOWN_SEC = 60.0
 DAMAGE_WARMUP_SEC = 3.0           # 시작 직후 이 시간 동안은 판정 보류 (기준 프레임 안정화)
 DAMAGE_PERSON_MARGIN = 20         # 사람 박스를 이만큼 px 넓혀서 제외 (그림자/잔상 여유)
 
+# [2026-09-18 오탐 수정] 싸움 영상에서 01 대신 02가 발생하던 원인 2가지를 잡는다.
+#   (1) 사람 마스크가 '현재 프레임의 박스'만 가렸다. 그런데 움직임(motion_mask)은
+#       직전 프레임과의 차이다. 사람이 빠르게 움직이면 직전 위치(잔상)는 마스크 밖에
+#       남아서 그대로 '변화'로 집계된다. 격하게 움직일수록 이 잔상이 커지므로
+#       폭행 상황에서 02 스파이크가 반드시 발생한다.
+#       -> 최근 DAMAGE_TRAIL_SEC 동안의 사람 박스를 모두 합집합으로 가린다.
+#   (2) 기준 프레임(ref)을 사람이 서 있는 영역까지 같이 갱신했다. 사람이 잠깐
+#       멈춰 서면 그 사람이 기준 프레임에 '배경으로' 구워진다. 그 사람이 움직이면
+#       원래 자리가 영구적인 차이로 남아 02가 확정된다.
+#       -> ref 갱신 시 사람 영역은 제외한다(사람은 절대 배경이 되지 않는다).
+DAMAGE_TRAIL_SEC = 1.0            # 사람 박스 잔상을 이 시간만큼 누적해서 함께 가린다
+
 # ---------------------------------------------------------------------------
 # 06 화재 임계값
 # ---------------------------------------------------------------------------
@@ -84,6 +96,21 @@ FIRE_WINDOW_SEC = 5.0             # flicker 계산에 쓰는 시간창
 FIRE_SUSTAIN_SEC = 3.0
 FIRE_COOLDOWN_SEC = 60.0
 FIRE_ANALYZE_WIDTH = 640          # 덩어리 분석은 축소해서 (젯슨 부하 절감, 정확도 영향 미미)
+# [2026-09-18 오탐 수정 2] 사람이 쓰러지는데 06이 발생하는 문제.
+#   원인: 주황·빨강 옷이 불꽃색 필터를 상시 통과한다(실측: 주황 티셔츠 S=212, V=235로 통과.
+#         피부톤은 S=85~117로 통과하지 못함). 서 있기만 해도 화면의 약 3%를 차지해 덩어리
+#         임계(1.2%)를 이미 넘긴 상태이고, 쓰러지는 순간 박스가 눕으면서 면적이 급변해
+#         flicker가 0.00 -> 0.13으로 올라가 임계(0.12)를 넘는다.
+#         즉 "뭉친 덩어리 + 면적 출렁임"이라는 불꽃의 신호를 쓰러지는 사람이 그대로 만족시킨다.
+#         모니터를 촬영하는 경우 화면 주사율까지 더해져 flicker가 더 쉽게 넘는다.
+#   수정 1: DamageDetector와 마찬가지로 **사람 박스 영역을 제외**한다. 사람은 불이 아니다.
+#   수정 2: 불은 타는 자리에 머물지만 사람은 이동한다. 덩어리 중심이 시간창 안에서
+#           크게 움직이면 불로 보지 않는다.
+FIRE_PERSON_MARGIN = 12           # 사람 박스를 이만큼 px 넓혀서 제외 (분석 해상도 기준)
+# 실측으로 잡은 값: 0.05는 합성 화재 영상을 아예 놓쳤고(미탐), 0.07은 감지가 17.2초로 늦어졌다.
+# 0.10부터 정상(10.8초)이라 여유를 둬서 0.12로 정했다. 오탐 쪽은 사람 마스킹과 flicker 조건이
+# 이미 막아주므로(걸어가는 사람은 덩어리 면적이 일정해 flicker가 안 오른다) 이 값은 보조 장치다.
+FIRE_MAX_DRIFT_RATIO = 0.12       # 덩어리 중심이 화면 폭의 이 비율 이상 움직이면 불이 아님
 
 
 class DamageDetector:
@@ -97,6 +124,7 @@ class DamageDetector:
         self._last_emit_at = None
         self._started_at = None
         self._diff_history = deque(maxlen=300)   # (시각, 기준 대비 변화량) - 급상승 판단용
+        self._box_history = deque(maxlen=60)     # (시각, 사람 박스들) - 잔상 마스킹용
 
     @staticmethod
     def _to_gray(frame):
@@ -114,19 +142,38 @@ class DamageDetector:
         return (float(xs.mean()), float(ys.mean()))
 
     @staticmethod
-    def _mask_people(mask, person_boxes: List[Box]):
-        h, w = mask.shape[:2]
+    def _person_area_mask(shape, person_boxes: List[Box]):
+        """사람이 차지한 영역을 1로 채운 마스크. 판정에서 제외할 구역."""
+        h, w = shape[:2]
+        area = np.zeros((h, w), dtype=np.uint8)
         m = DAMAGE_PERSON_MARGIN
         for (x1, y1, x2, y2) in person_boxes:
             ax1, ay1 = max(0, int(x1) - m), max(0, int(y1) - m)
             ax2, ay2 = min(w, int(x2) + m), min(h, int(y2) + m)
             if ax2 > ax1 and ay2 > ay1:
-                mask[ay1:ay2, ax1:ax2] = 0
-        return mask
+                area[ay1:ay2, ax1:ax2] = 1
+        return area
+
+    def _reset_ref(self, gray, keep):
+        """기준 프레임을 현재 화면으로 재설정. 단 사람이 있는 구역은 기존 값을 유지한다."""
+        new_ref = gray.astype(np.float32)
+        if self._ref is not None:
+            k = keep.astype(np.float32)
+            new_ref = new_ref * k + self._ref * (1.0 - k)
+        self._ref = new_ref
+
+    def _trail_boxes(self, now: float) -> List[Box]:
+        """최근 DAMAGE_TRAIL_SEC 동안 사람이 지나간 모든 박스(잔상 포함)."""
+        out = []
+        for t, boxes in self._box_history:
+            if now - t <= DAMAGE_TRAIL_SEC:
+                out.extend(boxes)
+        return out
 
     def update(self, frame, person_boxes: List[Box], now: float):
         """반환: (이벤트 또는 None, 기준 대비 변화 비율) - 뒤 값은 디버그 화면 표시용."""
         gray = self._to_gray(frame)
+        self._box_history.append((now, list(person_boxes)))
 
         if self._ref is None:
             self._ref = gray.astype(np.float32)
@@ -134,15 +181,21 @@ class DamageDetector:
             self._started_at = now
             return None, 0.0
 
+        # 사람이 '지금 있는 곳' + '최근 1초간 있었던 곳'을 모두 제외 구역으로 잡는다.
+        # 잔상까지 가리지 않으면 격하게 움직이는 사람 자체가 기물파손으로 잡힌다.
+        trail = self._trail_boxes(now)
+        person_area = self._person_area_mask(gray.shape, trail)
+        keep = 1 - person_area   # 사람이 없는 구역만 1
+
         # 1) 직전 프레임 대비 움직임(스파이크 판단용)
         motion_mask = (cv2.absdiff(gray, self._prev_gray) > DAMAGE_PIXEL_DIFF).astype(np.uint8)
-        motion_mask = self._mask_people(motion_mask, person_boxes)
+        motion_mask *= keep
         motion_ratio = float(np.count_nonzero(motion_mask)) / motion_mask.size
         self._prev_gray = gray
 
         # 2) 기준 프레임 대비 변화(=지금 뭔가 바뀐 채로 있는지)
         diff_mask = (cv2.absdiff(gray, self._ref.astype(np.uint8)) > DAMAGE_PIXEL_DIFF).astype(np.uint8)
-        diff_mask = self._mask_people(diff_mask, person_boxes)
+        diff_mask *= keep
         diff_ratio = float(np.count_nonzero(diff_mask)) / diff_mask.size
 
         warming_up = (now - self._started_at) < DAMAGE_WARMUP_SEC
@@ -151,7 +204,7 @@ class DamageDetector:
         # 2-b) 화면이 통째로 바뀐 경우(카메라 이동/장면 전환)는 기물파손이 아니다.
         #      이벤트를 내지 않고 현재 화면을 새 기준으로 삼는다.
         if diff_ratio >= DAMAGE_MAX_DIFF_RATIO:
-            self._ref = gray.astype(np.float32)
+            self._reset_ref(gray, keep)
             self._changed_since = None
             self._spike_at = None
             return None, diff_ratio
@@ -168,8 +221,11 @@ class DamageDetector:
         #    [중요] 예전엔 판정 중이 아니기만 하면 갱신했는데, 그러면 넘어진 진열대가 몇 초 만에
         #    기준 프레임에 서서히 흡수돼서(변화량 5.3% -> 0%) 영원히 이벤트가 안 뜬다.
         #    MOG2를 걷어낸 이유와 똑같은 함정이라, 갱신 조건을 "정상 상태일 때만"으로 좁혔다.
+        #    [2026-09-18] 사람 영역은 갱신 대상에서 제외한다. 사람을 배경으로 구워버리면
+        #    그 사람이 자리를 옮긴 순간 원래 자리가 영구적인 '변화'로 남아 02가 오탐된다.
         if (not judging) and motion_ratio < DAMAGE_QUIET_RATIO and diff_ratio < DAMAGE_BG_DIFF_RATIO:
-            cv2.accumulateWeighted(gray, self._ref, DAMAGE_REF_ALPHA)
+            cv2.accumulateWeighted(gray, self._ref, DAMAGE_REF_ALPHA,
+                                   mask=(keep * 255).astype(np.uint8))
 
         if warming_up:
             return None, diff_ratio
@@ -186,7 +242,7 @@ class DamageDetector:
                 self._last_emit_at = now
                 self._changed_since = None
                 self._spike_at = None
-                self._ref = gray.astype(np.float32)   # 새 상태를 기준으로 재설정(반복 발화 방지)
+                self._reset_ref(gray, keep)   # 새 상태를 기준으로 재설정(반복 발화 방지)
                 confidence = min(80.0, 40.0 + diff_ratio * 200)
                 return AnomalyEvent(
                     code='02',
@@ -223,6 +279,7 @@ class FireDetector:
         self._last_emit_at: Optional[float] = None
         self._last_mask = None
         self._last_scale = 1.0
+        self._centroid_history: Deque[Tuple[float, Tuple[float, float]]] = deque(maxlen=300)
 
     @staticmethod
     def _fire_base_point(mask):
@@ -245,6 +302,42 @@ class FireDetector:
             return p
         return (p[0] / self._last_scale, p[1] / self._last_scale)
 
+    @staticmethod
+    def _mask_people(mask, person_boxes: List[Box], scale: float):
+        """사람 박스 영역을 불꽃색 마스크에서 지운다.
+
+        person_boxes는 원본 프레임 좌표이고 마스크는 축소된 해상도라서 scale을 곱해야 한다.
+
+        [주의] 사람 뒤에 불이 있으면 그 부분은 가려진다. 다만 실제 화재는 사람 박스보다
+        훨씬 크고 박스 밖으로 번지므로 남은 영역에서 정상적으로 감지된다.
+        "사람 자체를 불로 오인하는 것"을 막는 게 더 중요하다고 판단했다.
+        """
+        if not person_boxes:
+            return mask
+        h, w = mask.shape[:2]
+        m = FIRE_PERSON_MARGIN
+        for (x1, y1, x2, y2) in person_boxes:
+            ax1 = max(0, int(x1 * scale) - m)
+            ay1 = max(0, int(y1 * scale) - m)
+            ax2 = min(w, int(x2 * scale) + m)
+            ay2 = min(h, int(y2 * scale) + m)
+            if ax2 > ax1 and ay2 > ay1:
+                mask[ay1:ay2, ax1:ax2] = 0
+        return mask
+
+    def _drift(self, now: float, frame_w: float) -> float:
+        """시간창 안에서 덩어리 중심이 움직인 거리(화면 폭 대비 비율).
+
+        불은 타는 자리에 머물지만 사람은 걷고 쓰러진다. 이 값이 크면 불이 아니다.
+        """
+        pts = [c for t, c in self._centroid_history if now - t <= FIRE_WINDOW_SEC]
+        if len(pts) < 2:
+            return 0.0
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        span = max(max(xs) - min(xs), max(ys) - min(ys))
+        return span / max(1.0, frame_w)
+
     def _largest_blob(self, mask):
         """가장 큰 불꽃색 덩어리의 (면적비율, 마스크)를 구한다.
 
@@ -261,8 +354,11 @@ class FireDetector:
         blob = (labels == idx).astype(np.uint8) * 255
         return float(areas[idx - 1]) / mask.size, blob
 
-    def update(self, frame, now: float):
-        """반환: (이벤트 또는 None, 가장 큰 불꽃색 덩어리 비율, flicker 지수)"""
+    def update(self, frame, person_boxes: List[Box], now: float):
+        """반환: (이벤트 또는 None, 가장 큰 불꽃색 덩어리 비율, flicker 지수)
+
+        person_boxes: 이번 프레임의 사람 박스(원본 좌표). 사람을 불로 오인하지 않도록 제외한다.
+        """
         h, w = frame.shape[:2]
         if w > FIRE_ANALYZE_WIDTH:
             scale = FIRE_ANALYZE_WIDTH / float(w)
@@ -272,11 +368,17 @@ class FireDetector:
 
         hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self._LOWER, self._UPPER)
+        mask = self._mask_people(mask, person_boxes, scale)   # 사람은 불이 아니다
 
         ratio, blob = self._largest_blob(mask)   # 전체 픽셀 수가 아니라 '가장 큰 덩어리'
         self._ratio_history.append((now, ratio))
         self._last_mask = blob
         self._last_scale = scale
+
+        if blob is not None:
+            ys, xs = np.nonzero(blob)
+            if len(xs):
+                self._centroid_history.append((now, (float(xs.mean()), float(ys.mean()))))
 
         window = [r for t, r in self._ratio_history if now - t <= FIRE_WINDOW_SEC]
         if len(window) < 4:
@@ -286,9 +388,11 @@ class FireDetector:
         variance = sum((r - mean_ratio) ** 2 for r in window) / len(window)
         flicker = (variance ** 0.5 / mean_ratio) if mean_ratio > 1e-6 else 0.0
 
+        drift = self._drift(now, small.shape[1])
         is_fire_like = (
             FIRE_MIN_BLOB_RATIO <= mean_ratio <= FIRE_MAX_BLOB_RATIO
             and FIRE_FLICKER_MIN_STD <= flicker <= FIRE_FLICKER_MAX_STD
+            and drift <= FIRE_MAX_DRIFT_RATIO      # 불은 제자리에서 탄다
         )
 
         if is_fire_like:

@@ -52,10 +52,32 @@ ASSAULT_IOU_THRESH = 0.10        # 두 사람 박스가 이 이상 겹치면 "�
 #   무관하게 "몸 크기의 몇 배만큼 움직였나"라는 동일한 기준이 된다.
 #   실측(위 영상): 폭행 구간 중앙값 약 2.6 키배수/초. 일반 보행은 0.8 안팎.
 ASSAULT_MOTION_THRESH = 1.2      # 키배수/초. 이 이상이면 "격한 움직임"
-ASSAULT_SCORE_PER_HIT = 1.0      # 위 조건을 만족한 프레임마다 더해지는 점수
-ASSAULT_SCORE_DECAY_PER_SEC = 1.2  # 조건이 끊기면 초당 이만큼씩 감소
-ASSAULT_SCORE_TRIGGER = 6.0      # 점수가 이 값을 넘으면 폭행 확정 (낮추면 민감, 높이면 둔감)
-ASSAULT_SCORE_MAX = 12.0         # 점수 상한 (너무 쌓여서 한참 안 내려가는 것 방지)
+
+# [2026-09-18 변경] "붙어있다" 판정을 IOU 단독 -> IOU 또는 간격비율로 확장.
+#   실제 싸움 영상(편의점 내부, 하향 각도 카메라) 실측 결과:
+#     IOU        중앙값 0.000 / 최대 0.128  -> IOU>=0.10 만족: 67프레임 중 3프레임 (4%)
+#     간격/키    중앙값 0.067                -> <=0.5 만족: 67프레임 중 59프레임 (88%)
+#   즉 마주보고 싸우는 두 사람은 박스가 '거의 안 겹친다'. 카메라를 위에서 비스듬히 내려보면
+#   두 사람이 좌우로 나란히 서기 때문에 박스가 옆으로 붙기만 하고 겹치지 않는 것이다.
+#   그래서 IOU 하나로 근접을 판정하면 원리적으로 폭행을 잡을 수 없다.
+#   대신 "두 박스 사이의 빈 간격"을 사람 키로 나눈 값을 쓴다. 키로 나누는 이유는 움직임
+#   세기와 동일하다 - 카메라에서 멀면 같은 거리도 픽셀 수가 작아지므로, 키 대비로 보면
+#   거리와 무관하게 "팔 뻗으면 닿는 거리인가"를 판정할 수 있다(사람 팔 길이 ≈ 키의 0.4배).
+ASSAULT_GAP_RATIO = 0.5          # 박스 사이 빈 간격 / 평균 키. 이 이하면 "팔 닿는 거리"
+ASSAULT_CDIST_RATIO = 1.3        # 박스 중심거리 / 평균 키. 간격이 0이어도 중심이 너무 멀면 제외
+# 단안(单眼) 카메라에서 깊이를 추정하는 가장 싼 방법은 "겉보기 크기"다. 같은 사람이라도
+# 카메라에 가까우면 박스가 크고 멀면 작다. 즉 두 박스의 키 비율이 크게 다르면 두 사람은
+# 서로 다른 거리에 있다는 뜻이므로, 화면상 겹쳐 보여도 실제로는 닿을 수 없다.
+# (카메라 앞을 지나가는 사람 + 저 뒤 진열대 앞의 사람 → 화면에선 겹침, 실제로는 무관)
+ASSAULT_HEIGHT_RATIO_MAX = 2.0   # 큰 박스 키 / 작은 박스 키. 이 이상 차이나면 다른 거리로 판단
+
+# [2026-09-18 변경] 점수 누적을 "프레임당 +1" -> "시간당 +N"으로 교체.
+#   프레임당 점수는 FPS에 따라 임계 도달 시간이 달라진다(8fps면 0.75초, 4fps면 1.5초).
+#   시간 기반이면 "격한 접촉이 누적 N초"라는 물리적 의미가 고정된다.
+ASSAULT_SCORE_PER_SEC = 1.0      # 조건 만족 중에는 초당 이만큼 누적
+ASSAULT_SCORE_DECAY_PER_SEC = 0.8  # 조건이 끊기면 초당 이만큼씩 감소
+ASSAULT_SCORE_TRIGGER = 2.0      # 누적 2.0 = "격한 접촉이 합계 2초" -> 폭행 확정
+ASSAULT_SCORE_MAX = 4.0          # 점수 상한 (너무 쌓여서 한참 안 내려가는 것 방지)
 
 # --- 05 장시간체류 ---
 LOITER_SEC = 300.0               # 한 사람이 화면에 이만큼(초) 머물면 체류 (기본 5분)
@@ -87,6 +109,36 @@ def iou(a: Box, b: Box) -> float:
 def center(b: Box) -> Tuple[float, float]:
     x1, y1, x2, y2 = b
     return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+
+def mean_height(a: Box, b: Box) -> float:
+    """두 사람의 평균 키(픽셀). 거리 정규화의 분모로 쓴다."""
+    return max(1.0, ((a[3] - a[1]) + (b[3] - b[1])) / 2.0)
+
+
+def gap_ratio(a: Box, b: Box) -> float:
+    """두 박스 사이의 '빈 간격'을 평균 키로 나눈 값.
+
+    겹쳐 있으면 0. 옆으로 나란히 붙어만 있어도 0에 가깝다.
+    IOU와 달리 '겹침'을 요구하지 않으므로, 마주보고 싸우는 두 사람처럼
+    박스가 옆으로 닿기만 하는 상황도 근접으로 잡힌다.
+    """
+    dx = max(0.0, max(a[0], b[0]) - min(a[2], b[2]))
+    dy = max(0.0, max(a[1], b[1]) - min(a[3], b[3]))
+    gap = (dx * dx + dy * dy) ** 0.5
+    return gap / mean_height(a, b)
+
+
+def center_dist_ratio(a: Box, b: Box) -> float:
+    """두 박스 중심 사이 거리를 평균 키로 나눈 값.
+
+    gap_ratio 단독으로는 '한 사람이 다른 사람 박스를 통째로 품는' 경우
+    (예: 카메라 앞을 지나가는 사람과 멀리 있는 사람이 화면상 겹침)도
+    0이 나온다. 중심거리로 한 번 더 걸러서 그런 경우를 배제한다.
+    """
+    ca, cb = center(a), center(b)
+    d = ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
+    return d / mean_height(a, b)
 
 
 @dataclass
@@ -267,15 +319,14 @@ class TrackManager:
     # 01 폭행 (점수 누적 방식 - track ID가 바뀌어도 증거가 유지됨)
     # -----------------------------------------------------------------
     def _check_assault(self, now: float) -> Optional[AnomalyEvent]:
-        # 1) 시간 경과분만큼 점수 감쇠
+        dt = 0.0
         if self._assault_score_t is not None:
-            dt = max(0.0, now - self._assault_score_t)
-            self.assault_score = max(0.0, self.assault_score - dt * ASSAULT_SCORE_DECAY_PER_SEC)
+            dt = min(1.0, max(0.0, now - self._assault_score_t))  # 프레임 드랍 시 폭주 방지
         self._assault_score_t = now
 
-        # 2) 이번 프레임에 "겹치면서 빠른" 쌍이 있는지 확인
+        # 1) 이번 프레임에 "붙어 있으면서 격하게 움직이는" 쌍이 있는지 확인
         ids = list(self.tracks.keys())
-        best_overlap, best_motion, best_pair = 0.0, 0.0, None
+        best = None   # (점수기준, overlap, gap, motion, pair)
 
         for i in range(len(ids)):
             for j in range(i + 1, len(ids)):
@@ -287,39 +338,65 @@ class TrackManager:
                 if now - ta.last_seen > 0.5 or now - tb.last_seen > 0.5:
                     continue
 
+                # 깊이 필터: 겉보기 키가 2배 이상 다르면 서로 다른 거리에 있는 사람
+                ha, hb = max(1.0, ba[3] - ba[1]), max(1.0, bb[3] - bb[1])
+                if max(ha, hb) / min(ha, hb) > ASSAULT_HEIGHT_RATIO_MAX:
+                    continue
+
                 overlap = iou(ba, bb)
+                gap = gap_ratio(ba, bb)
+                cdist = center_dist_ratio(ba, bb)
                 motion = max(ta.motion_intensity(now), tb.motion_intensity(now))
-                if overlap >= ASSAULT_IOU_THRESH and motion >= ASSAULT_MOTION_THRESH:
-                    if overlap > best_overlap:
-                        best_overlap, best_motion = overlap, motion
-                        best_pair = (ta.track_id, tb.track_id)
 
-        # 3) 조건 만족 프레임이면 점수 누적
-        if best_pair is not None:
-            self.assault_score = min(ASSAULT_SCORE_MAX, self.assault_score + ASSAULT_SCORE_PER_HIT)
-            self.assault_last_info = "iou=%.2f mot=%.1f" % (best_overlap, best_motion)
+                # 근접 조건: 겹치거나(IOU) 또는 팔 닿는 거리(간격/키)
+                near = (overlap >= ASSAULT_IOU_THRESH or gap <= ASSAULT_GAP_RATIO) \
+                    and cdist <= ASSAULT_CDIST_RATIO
+                if near and motion >= ASSAULT_MOTION_THRESH:
+                    # 더 가깝고 더 격한 쌍을 대표로 삼는다
+                    rank = motion / (1.0 + gap)
+                    if best is None or rank > best[0]:
+                        best = (rank, overlap, gap, motion, (ta.track_id, tb.track_id))
 
-        # 4) 점수가 임계 초과하면 확정
-        if self.assault_score >= ASSAULT_SCORE_TRIGGER:
+        # 2) 조건 만족 구간이면 시간에 비례해 점수 누적, 아니면 감쇠
+        if best is not None:
+            self.assault_score = min(
+                ASSAULT_SCORE_MAX, self.assault_score + dt * ASSAULT_SCORE_PER_SEC
+            )
+            self.assault_last_info = "iou=%.2f gap=%.2f mot=%.1f score=%.2f" % (
+                best[1], best[2], best[3], self.assault_score
+            )
+        else:
+            self.assault_score = max(0.0, self.assault_score - dt * ASSAULT_SCORE_DECAY_PER_SEC)
+
+        # 3) 점수가 임계 초과하면 확정
+        if best is not None and self.assault_score >= ASSAULT_SCORE_TRIGGER:
+            _, best_overlap, best_gap, best_motion, best_pair = best
             self.assault_score = 0.0  # 확정 후 초기화 (연속 재발화 방지)
-            pair = list(best_pair) if best_pair else []
+            pair = list(best_pair)
             # 두 사람 발 위치의 중간 지점을 사건 위치로 본다
             pair_point = None
-            if best_pair:
-                pa = self.tracks.get(best_pair[0]), self.tracks.get(best_pair[1])
-                boxes = [t.latest_box() for t in pa if t and t.latest_box()]
-                if boxes:
-                    gps = [ground_point(b) for b in boxes]
-                    pair_point = (sum(g[0] for g in gps) / len(gps),
-                                  sum(g[1] for g in gps) / len(gps))
-            confidence = min(90.0, 45.0 + best_overlap * 100 + best_motion * 5.0)
+            pa = self.tracks.get(best_pair[0]), self.tracks.get(best_pair[1])
+            boxes = [t.latest_box() for t in pa if t and t.latest_box()]
+            if boxes:
+                gps = [ground_point(b) for b in boxes]
+                pair_point = (sum(g[0] for g in gps) / len(gps),
+                              sum(g[1] for g in gps) / len(gps))
+            # 신뢰도: 가까울수록 / 격할수록 높게. 겹침까지 있으면 가산.
+            confidence = min(
+                92.0,
+                50.0
+                + max(0.0, (ASSAULT_GAP_RATIO - best_gap)) * 30.0
+                + best_overlap * 60.0
+                + min(20.0, best_motion * 6.0),
+            )
             return AnomalyEvent(
                 code='01',
                 track_ids=pair,
                 confidence=round(confidence, 1),
                 detail=(
                     "두 사람이 밀착한 상태에서 격한 몸동작이 반복 감지됨 "
-                    "(겹침 %.2f, 움직임 세기 %.1f)" % (best_overlap, best_motion)
+                    "(겹침 %.2f, 간격비 %.2f, 움직임 세기 %.1f)"
+                    % (best_overlap, best_gap, best_motion)
                 ),
                 at=now,
                 point=pair_point,
@@ -330,10 +407,16 @@ class TrackManager:
     # 04 무단침입 (영업시간 외 사람 감지)
     # -----------------------------------------------------------------
     def _check_intrusion(self, now: float, business_hours: Tuple[int, int],
-                         force_after_hours: bool = False) -> List[AnomalyEvent]:
+                         force_after_hours: bool = False,
+                         wall_now: Optional[float] = None) -> List[AnomalyEvent]:
         open_hour, close_hour = business_hours
         if not force_after_hours:
-            local_hour = time.localtime(now).tm_hour
+            # [2026-09-18 수정] 영업시간 판정의 기준 시각을 now와 분리했다.
+            #   now는 카메라 모드에선 벽시계지만 영상 파일 모드에선 '영상 재생 위치'(0초부터)다.
+            #   그래서 영상으로 테스트하면 1970-01-01 기준으로 시각이 계산돼 04가 오탐됐다.
+            #   "지금 매장이 닫혀 있나"는 영상 시간축이 아니라 실제 벽시계로 봐야 하는 값이라
+            #   wall_now(기본값 = 실제 현재시각)를 따로 받는다. 테스트에서는 가짜 시각 주입 가능.
+            local_hour = time.localtime(wall_now if wall_now is not None else time.time()).tm_hour
             if open_hour <= local_hour < close_hour:
                 return []   # 영업시간 중이면 판정 안 함
 
@@ -375,7 +458,8 @@ class TrackManager:
     # -----------------------------------------------------------------
     def check_all(self, now: Optional[float] = None,
                   business_hours: Tuple[int, int] = (9, 22),
-                  force_after_hours: bool = False) -> List[AnomalyEvent]:
+                  force_after_hours: bool = False,
+                  wall_now: Optional[float] = None) -> List[AnomalyEvent]:
         now = now if now is not None else time.time()
         events: List[AnomalyEvent] = []
 
@@ -388,7 +472,7 @@ class TrackManager:
         if assault:
             events.append(assault)
 
-        events.extend(self._check_intrusion(now, business_hours, force_after_hours))
+        events.extend(self._check_intrusion(now, business_hours, force_after_hours, wall_now))
         events.extend(self._check_loitering(now))
 
         # 전역 쿨다운 필터: track ID가 자주 바뀌어도 같은 코드가 연달아 나가는 걸 최종 차단
