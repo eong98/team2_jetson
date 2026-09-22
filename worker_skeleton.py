@@ -42,6 +42,7 @@ Python 3.6 환경이라 `from __future__ import annotations`(3.7+)는 쓰지 않
 
 import argparse
 import queue
+import random                 # [2026-09-22 추가] 임의 도면 좌표(x/y) 생성용
 import socketserver
 import threading
 import time
@@ -81,6 +82,15 @@ REPORT_ISSUE_ENDPOINT = FASTAPI_BASE_URL + "/api/cctv/issue/report"
 VISITOR_ENTER_ENDPOINT = FASTAPI_BASE_URL + "/api/cctv/visitor/enter"
 VISITOR_EXIT_ENDPOINT = FASTAPI_BASE_URL + "/api/cctv/visitor/exit"
 REPORT_TIMEOUT_SEC = 60      # 서버가 LLM(comnet 생성)을 기다리므로 넉넉히. 비동기라 루프엔 영향 없음.
+
+# [2026-09-22 추가] 도면 좌표(x/y)는 호모그래피 대신 "임의 값"을 무조건 보낸다.
+# 이유: 시연 영상(01/02/03/06.mp4)마다 카메라 각도·바닥이 달라 영상별 캘리브레이션이 사실상 불가.
+#       FastAPI는 x/y(0~1)가 있어야 AIISSUEMAP 도면 표시를 할 수 있으므로, 좌표가 빠지지 않게
+#       항상 채워서 보낸다. (신뢰도 필터링/1회 발송은 FastAPI 쪽 담당)
+# 범위를 0~1 전체가 아니라 0.15~0.85로 잡은 이유: 도면 가장자리(벽/테두리)에 점이 찍히면
+#       시연 화면에서 잘 안 보이고, 서버의 0<=x<=1 검증에 부동소수점 경계로 걸릴 일도 없앤다.
+FAKE_XY_MIN = 0.15
+FAKE_XY_MAX = 0.85
 
 # 판정할 코드 기본값. --codes 옵션으로 실행할 때마 바꿀 수 있다.
 #
@@ -284,9 +294,15 @@ def _post_event(event: AnomalyEvent) -> None:
         payload["imgX"], payload["imgY"] = round(event.point[0], 1), round(event.point[1], 1)
         if FRAME_SIZE[0]:
             payload["imgW"], payload["imgH"] = FRAME_SIZE[0], FRAME_SIZE[1]
-        plan = get_homography().to_plan(event.point)
-        if plan is not None:
-            payload["x"], payload["y"] = plan[0], plan[1]
+        # [2026-09-22 삭제] 호모그래피 변환 -> 아래 임의 좌표로 대체
+        # plan = get_homography().to_plan(event.point)
+        # if plan is not None:
+        #     payload["x"], payload["y"] = plan[0], plan[1]
+
+    # [2026-09-22 추가] 도면 좌표는 point 유무와 상관없이 "무조건" 임의 값으로 보낸다.
+    # (위 if 블록 밖에 둔 이유: 02/06처럼 point가 None인 이벤트도 x/y가 빠지면 안 되기 때문)
+    payload["x"] = round(random.uniform(FAKE_XY_MIN, FAKE_XY_MAX), 3)
+    payload["y"] = round(random.uniform(FAKE_XY_MIN, FAKE_XY_MAX), 3)
     try:
         res = requests.post(REPORT_ISSUE_ENDPOINT, json=payload, timeout=REPORT_TIMEOUT_SEC)
         res.raise_for_status()
@@ -600,7 +616,9 @@ def main() -> None:
     else:
         print("[worker] 디버그 화면 없이 실행 (--no-display)")
     start_sender_thread()
-    get_homography()     # homography.json 로드 (없으면 경고만 출력하고 좌표 없이 동작)
+    # [2026-09-22 주석처리] 도면 좌표를 임의 값으로 보내므로 homography.json 로드 불필요
+    # get_homography()     # homography.json 로드 (없으면 경고만 출력하고 좌표 없이 동작)
+    print("[worker] 도면 좌표: 임의 값 전송 모드 (x,y = %.2f~%.2f)" % (FAKE_XY_MIN, FAKE_XY_MAX))
 
     print("[worker] 시작 (source=%s, report=%s, loiter=%.0fs, codes=%s%s) - Ctrl+C로 종료"
           % (args.source, _enable_report, args.loiter, ",".join(sorted(enabled_codes)),

@@ -110,7 +110,11 @@ FIRE_PERSON_MARGIN = 12           # 사람 박스를 이만큼 px 넓혀서 제�
 # 실측으로 잡은 값: 0.05는 합성 화재 영상을 아예 놓쳤고(미탐), 0.07은 감지가 17.2초로 늦어졌다.
 # 0.10부터 정상(10.8초)이라 여유를 둬서 0.12로 정했다. 오탐 쪽은 사람 마스킹과 flicker 조건이
 # 이미 막아주므로(걸어가는 사람은 덩어리 면적이 일정해 flicker가 안 오른다) 이 값은 보조 장치다.
-FIRE_MAX_DRIFT_RATIO = 0.12       # 덩어리 중심이 화면 폭의 이 비율 이상 움직이면 불이 아님
+# [2026-09-22 수정] 0.12 -> 0.20. 시연 영상(06.mp4)은 카메라가 서서히 줌/이동하고 불꽃이 여러
+# 갈래로 갈라지면서 '가장 큰 덩어리'가 갈래 사이를 오가서, 실제 불인데도 중심 이동이 0.14로 측정돼
+# 화재가 영상 끝까지 확정되지 않았다. 사람 오탐은 사람 박스 마스킹이 1차로 막으므로 보조 장치인
+# 이 값은 여유 있게 둔다.
+FIRE_MAX_DRIFT_RATIO = 0.20       # 덩어리 중심이 화면 폭의 이 비율 이상 움직이면 불이 아님
 
 
 class DamageDetector:
@@ -375,7 +379,11 @@ class FireDetector:
         self._last_mask = blob
         self._last_scale = scale
 
-        if blob is not None:
+        # [2026-09-22 수정] 불꽃 크기(FIRE_MIN_BLOB_RATIO) 이상인 덩어리만 중심 이력에 넣는다.
+        # 전에는 불이 나기 전의 작은 잡음 덩어리(0.1%)까지 기록해서, 잡음 위치 -> 실제 불 위치로
+        # 중심이 '점프'한 것을 불이 움직인 것(drift)으로 오해했다. 06.mp4 실측 drift 0.14~0.25로
+        # 상한 0.12를 넘어 화재가 영상 끝까지 한 번도 확정되지 않은 원인.
+        if blob is not None and ratio >= FIRE_MIN_BLOB_RATIO:
             ys, xs = np.nonzero(blob)
             if len(xs):
                 self._centroid_history.append((now, (float(xs.mean()), float(ys.mean()))))
@@ -403,7 +411,12 @@ class FireDetector:
             if sustained >= FIRE_SUSTAIN_SEC and can_emit:
                 self._last_emit_at = now
                 self._fire_since = None
-                confidence = min(75.0, 25.0 + mean_ratio * 200 + flicker * 50)
+                # [2026-09-22 수정] 25 + ... (최대 75) -> 50 + ... (최대 90)
+                # 기존 공식은 실제 불(덩어리 3~5%, flicker 0.3~0.6)이 약 50점밖에 안 나와서
+                # FastAPI의 신뢰도 60% 알림 기준을 못 넘었다. 조건(덩어리/flicker/drift/3초 유지)을
+                # 모두 통과했다는 것 자체가 강한 증거이므로 기본점을 50으로 올린다.
+                #   예) 덩어리 3.7%, flicker 0.35 -> 50 + 11.1 + 10.5 = 71.6
+                confidence = min(90.0, 50.0 + mean_ratio * 300 + flicker * 30)
                 return AnomalyEvent(
                     code='06',
                     track_ids=[],
