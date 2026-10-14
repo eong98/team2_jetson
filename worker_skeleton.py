@@ -303,16 +303,23 @@ def _post_event(event: AnomalyEvent) -> None:
     # (위 if 블록 밖에 둔 이유: 02/06처럼 point가 None인 이벤트도 x/y가 빠지면 안 되기 때문)
     payload["x"] = round(random.uniform(FAKE_XY_MIN, FAKE_XY_MAX), 3)
     payload["y"] = round(random.uniform(FAKE_XY_MIN, FAKE_XY_MAX), 3)
+    # [2026-10-02 추가] "보낸 시점"과 "서버가 응답한 시점"을 구분해서 로그로 남긴다.
+    # 기존에는 응답이 온 뒤에만 로그가 찍혀서, 서버가 LLM(comnet 생성) 때문에 10~40초 늦게
+    # 응답하면 "상황이 끝나야 전송되는 것"처럼 보였다. 실제 전송은 이벤트 확정 직후에 나간다.
+    sent_at = time.time()
+    print("[report] 전송 시작 code=%s conf=%s (서버 응답 대기 중...)" % (event.code, event.confidence))
     try:
         res = requests.post(REPORT_ISSUE_ENDPOINT, json=payload, timeout=REPORT_TIMEOUT_SEC)
         res.raise_for_status()
         pos = ""
         if "x" in payload:
             pos = " 도면좌표=(%.1f, %.1f)" % (payload["x"], payload["y"])
-        print("[report] code=%s conf=%s%s -> %s" % (event.code, event.confidence, pos, res.status_code))
+        # [2026-10-02 수정] 서버 응답까지 걸린 시간(초)을 함께 출력
+        print("[report] code=%s conf=%s%s -> %s (서버 응답 %.1f초)"
+              % (event.code, event.confidence, pos, res.status_code, time.time() - sent_at))
     except requests.RequestException as e:
         # 안전 이벤트라 전송 실패해도 워커는 계속 돌아야 함 (재시도 큐는 추후 보강)
-        print("[report] 전송 실패: %s (code=%s)" % (e, event.code))
+        print("[report] 전송 실패: %s (code=%s, %.1f초 경과)" % (e, event.code, time.time() - sent_at))
 
 
 def _sender_loop() -> None:
